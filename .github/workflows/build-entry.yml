@@ -1,0 +1,163 @@
+name: Build Xiaomi compatible entry
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build compatible entry and one-shot boot launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p compat/src/com/gathin/tvhome/bridge compat/res/mipmap-xhdpi compat/res/drawable-nodpi compat/classes compat/dex artifact
+          cat > compat/AndroidManifest.xml <<'SOURCE_AndroidManifest'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.gathin.tvhome.bridge">
+              <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+              <uses-feature android:name="android.software.leanback" android:required="false" />
+              <queries><package android:name="com.gathin.tvhome" /></queries>
+              <application android:label="CleanYourTV" android:icon="@mipmap/ic_launcher" android:banner="@drawable/banner" android:allowBackup="false" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true" android:excludeFromRecents="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                          <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <receiver android:name=".BootReceiver" android:exported="true" android:permission="android.permission.DUMP">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                      </intent-filter>
+                  </receiver>
+                  <service android:name=".BootJobService" android:exported="true" android:permission="android.permission.BIND_JOB_SERVICE" />
+              </application>
+          </manifest>
+          SOURCE_AndroidManifest
+          cat > compat/src/com/gathin/tvhome/bridge/MainActivity.java <<'SOURCE_MainActivity'
+          package com.gathin.tvhome.bridge;
+          
+          import android.app.Activity;
+          import android.app.job.JobInfo;
+          import android.app.job.JobScheduler;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.util.Log;
+          import android.widget.Toast;
+          
+          public final class MainActivity extends Activity {
+              static final int BOOT_JOB = 100;
+          
+              static boolean openHome(Context context) {
+                  try {
+                      context.startActivity(new Intent(Intent.ACTION_MAIN)
+                          .setComponent(new ComponentName("com.gathin.tvhome", "com.gathin.tvhome.MainActivity"))
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED));
+                      Log.i("CleanYourTVBridge", "Requested CleanYourTV launch");
+                      return true;
+                  } catch (RuntimeException error) {
+                      Log.e("CleanYourTVBridge", "Could not open CleanYourTV", error);
+                      return false;
+                  }
+              }
+          
+              static void scheduleAfterBoot(Context context) {
+                  JobInfo job = new JobInfo.Builder(BOOT_JOB,
+                      new ComponentName(context, BootJobService.class))
+                      .setMinimumLatency(15000)
+                      .setOverrideDeadline(30000)
+                      .setPersisted(true)
+                      .build();
+                  int result = context.getSystemService(JobScheduler.class).schedule(job);
+                  Log.i("CleanYourTVBridge", "Scheduled one boot launch: " + result);
+              }
+          
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
+                  if (!openHome(this)) {
+                      Toast.makeText(this, "请先安装 CleanYourTV 主屏幕", Toast.LENGTH_LONG).show();
+                  }
+                  finish();
+              }
+          }
+          SOURCE_MainActivity
+          cat > compat/src/com/gathin/tvhome/bridge/BootReceiver.java <<'SOURCE_BootReceiver'
+          package com.gathin.tvhome.bridge;
+          
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          
+          public final class BootReceiver extends BroadcastReceiver {
+              @Override public void onReceive(Context context, Intent intent) {
+                  String action = intent.getAction();
+                  if (Intent.ACTION_BOOT_COMPLETED.equals(action)
+                          || Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
+                      MainActivity.scheduleAfterBoot(context);
+                  }
+              }
+          }
+          SOURCE_BootReceiver
+          cat > compat/src/com/gathin/tvhome/bridge/BootJobService.java <<'SOURCE_BootJobService'
+          package com.gathin.tvhome.bridge;
+          
+          import android.app.job.JobParameters;
+          import android.app.job.JobService;
+          import android.os.PowerManager;
+          import android.util.Log;
+          
+          public final class BootJobService extends JobService {
+              @Override public boolean onStartJob(JobParameters job) {
+                  PowerManager power = getSystemService(PowerManager.class);
+                  if (power.isInteractive()) {
+                      MainActivity.openHome(this);
+                  } else {
+                      Log.i("CleanYourTVBridge", "TV is asleep; skipped boot launch");
+                  }
+                  return false;
+              }
+          
+              @Override public boolean onStopJob(JobParameters job) { return false; }
+          }
+          SOURCE_BootJobService
+          cp launcher/app/src/main/res/mipmap-xhdpi/ic_launcher.jpg compat/res/mipmap-xhdpi/
+          cp launcher/app/src/main/res/drawable-nodpi/banner.jpg compat/res/drawable-nodpi/
+          SDK=/usr/local/lib/android/sdk
+          BT="$SDK/build-tools/34.0.0"
+          JAR="$SDK/platforms/android-34/android.jar"
+          "$BT/aapt2" compile --dir compat/res -o compat/res.zip
+          "$BT/aapt2" link -I "$JAR" --manifest compat/AndroidManifest.xml --version-code 1 --version-name 1.0 -o compat/unsigned.apk compat/res.zip
+          javac -encoding UTF-8 -source 8 -target 8 -classpath "$JAR" -d compat/classes compat/src/com/gathin/tvhome/bridge/*.java
+          "$BT/d8" --lib "$JAR" --min-api 26 --output compat/dex compat/classes/com/gathin/tvhome/bridge/*.class
+          zip -j compat/unsigned.apk compat/dex/classes.dex
+          "$BT/zipalign" -p -f 4 compat/unsigned.apk compat/aligned.apk
+          keytool -genkeypair -keystore compat/debug.keystore -storepass android -keypass android -alias androiddebugkey -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 10000
+          "$BT/apksigner" sign --ks compat/debug.keystore --ks-pass pass:android --key-pass pass:android --out artifact/CleanYourTV-Entry.apk compat/aligned.apk
+          "$BT/apksigner" verify --verbose artifact/CleanYourTV-Entry.apk
+          "$BT/aapt2" dump badging artifact/CleanYourTV-Entry.apk
+          (cd artifact && sha256sum CleanYourTV-Entry.apk > SHA256SUMS.txt)
+          cp compat/*.xml artifact/
+          cp compat/src/com/gathin/tvhome/bridge/*.java artifact/
+          printf '\nAPK_BASE64_BEGIN\n'
+          base64 -w 76 artifact/CleanYourTV-Entry.apk
+          printf '\nAPK_BASE64_END\n'
+          cat artifact/SHA256SUMS.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: CleanYourTV-compatible-entry
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14
