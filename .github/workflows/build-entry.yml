@@ -15,15 +15,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Build compatible entry and one-shot boot launcher
+      - name: Build compatible entry and opt-in home redirect
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p compat/src/com/gathin/tvhome/bridge compat/res/mipmap-xhdpi compat/res/drawable-nodpi compat/classes compat/dex artifact
+          mkdir -p compat/src/com/gathin/tvhome/bridge compat/res/mipmap-xhdpi compat/res/drawable-nodpi compat/res/xml compat/res/values compat/classes compat/dex artifact
           cat > compat/AndroidManifest.xml <<'SOURCE_AndroidManifest'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.gathin.tvhome.bridge">
               <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
-              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
               <uses-feature android:name="android.software.leanback" android:required="false" />
               <queries><package android:name="com.gathin.tvhome" /></queries>
@@ -35,13 +34,10 @@ jobs:
                           <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
                       </intent-filter>
                   </activity>
-                  <receiver android:name=".BootReceiver" android:exported="true" android:permission="android.permission.DUMP">
-                      <intent-filter>
-                          <action android:name="android.intent.action.BOOT_COMPLETED" />
-                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
-                      </intent-filter>
-                  </receiver>
-                  <service android:name=".BootJobService" android:exported="true" android:permission="android.permission.BIND_JOB_SERVICE" />
+                  <service android:name=".HomeRedirectService" android:label="CleanYourTV 开机与Home键" android:exported="true" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService" /></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/home_redirect" />
+                  </service>
               </application>
           </manifest>
           SOURCE_AndroidManifest
@@ -49,8 +45,6 @@ jobs:
           package com.gathin.tvhome.bridge;
           
           import android.app.Activity;
-          import android.app.job.JobInfo;
-          import android.app.job.JobScheduler;
           import android.content.ComponentName;
           import android.content.Context;
           import android.content.Intent;
@@ -59,8 +53,6 @@ jobs:
           import android.widget.Toast;
           
           public final class MainActivity extends Activity {
-              static final int BOOT_JOB = 100;
-          
               static boolean openHome(Context context) {
                   try {
                       context.startActivity(new Intent(Intent.ACTION_MAIN)
@@ -74,17 +66,6 @@ jobs:
                   }
               }
           
-              static void scheduleAfterBoot(Context context) {
-                  JobInfo job = new JobInfo.Builder(BOOT_JOB,
-                      new ComponentName(context, BootJobService.class))
-                      .setMinimumLatency(15000)
-                      .setOverrideDeadline(30000)
-                      .setPersisted(true)
-                      .build();
-                  int result = context.getSystemService(JobScheduler.class).schedule(job);
-                  Log.i("CleanYourTVBridge", "Scheduled one boot launch: " + result);
-              }
-          
               @Override public void onCreate(Bundle state) {
                   super.onCreate(state);
                   if (!openHome(this)) {
@@ -94,52 +75,76 @@ jobs:
               }
           }
           SOURCE_MainActivity
-          cat > compat/src/com/gathin/tvhome/bridge/BootReceiver.java <<'SOURCE_BootReceiver'
+          cat > compat/src/com/gathin/tvhome/bridge/HomeRedirectService.java <<'SOURCE_HomeRedirectService'
           package com.gathin.tvhome.bridge;
           
-          import android.content.BroadcastReceiver;
-          import android.content.Context;
-          import android.content.Intent;
-          
-          public final class BootReceiver extends BroadcastReceiver {
-              @Override public void onReceive(Context context, Intent intent) {
-                  String action = intent.getAction();
-                  if (Intent.ACTION_BOOT_COMPLETED.equals(action)
-                          || Intent.ACTION_MY_PACKAGE_REPLACED.equals(action)) {
-                      MainActivity.scheduleAfterBoot(context);
-                  }
-              }
-          }
-          SOURCE_BootReceiver
-          cat > compat/src/com/gathin/tvhome/bridge/BootJobService.java <<'SOURCE_BootJobService'
-          package com.gathin.tvhome.bridge;
-          
-          import android.app.job.JobParameters;
-          import android.app.job.JobService;
+          import android.accessibilityservice.AccessibilityService;
+          import android.os.Handler;
+          import android.os.Looper;
           import android.os.PowerManager;
+          import android.os.SystemClock;
           import android.util.Log;
+          import android.view.accessibility.AccessibilityEvent;
           
-          public final class BootJobService extends JobService {
-              @Override public boolean onStartJob(JobParameters job) {
-                  PowerManager power = getSystemService(PowerManager.class);
-                  if (power.isInteractive()) {
-                      MainActivity.openHome(this);
-                  } else {
-                      Log.i("CleanYourTVBridge", "TV is asleep; skipped boot launch");
-                  }
-                  return false;
+          /** Only observes stock home window identity. Does not request screen content or key events. */
+          public final class HomeRedirectService extends AccessibilityService {
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private long lastLaunch = -5000;
+          
+              private void openHome() {
+                  if (!getSystemService(PowerManager.class).isInteractive()) return;
+                  long now = SystemClock.elapsedRealtime();
+                  if (now - lastLaunch < 2000) return;
+                  lastLaunch = now;
+                  MainActivity.openHome(this);
               }
           
-              @Override public boolean onStopJob(JobParameters job) { return false; }
+              @Override protected void onServiceConnected() {
+                  Log.i("CleanYourTVBridge", "Home redirect service connected");
+                  boolean first = getSharedPreferences("home", MODE_PRIVATE).getBoolean("first", true);
+                  getSharedPreferences("home", MODE_PRIVATE).edit().putBoolean("first", false).apply();
+                  // One launch at initial opt-in / boot; no polling or repeated foreground service.
+                  if (first || SystemClock.elapsedRealtime() < 180000) {
+                      handler.postDelayed(this::openHome, 2000);
+                  }
+              }
+          
+              @Override public void onAccessibilityEvent(AccessibilityEvent event) {
+                  if (event.getEventType() != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return;
+                  if (!"com.mitv.tvhome".contentEquals(event.getPackageName() == null ? "" : event.getPackageName())) return;
+                  if (!"com.mitv.tvhome.MainActivityUserMode".contentEquals(event.getClassName() == null ? "" : event.getClassName())) return;
+                  Log.i("CleanYourTVBridge", "Stock home window detected");
+                  openHome();
+              }
+          
+              @Override public void onInterrupt() { }
+              @Override public void onDestroy() {
+                  handler.removeCallbacksAndMessages(null);
+                  super.onDestroy();
+              }
           }
-          SOURCE_BootJobService
+          SOURCE_HomeRedirectService
+          cat > compat/res/xml/home_redirect.xml <<'SOURCE_home_redirect'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:packageNames="com.mitv.tvhome"
+              android:notificationTimeout="300"
+              android:canRetrieveWindowContent="false"
+              android:description="@string/service_description" />
+          SOURCE_home_redirect
+          cat > compat/res/values/strings.xml <<'SOURCE_strings'
+          <resources>
+              <string name="service_description">检测小米主桌面出现并打开 CleanYourTV。仅识别主桌面的应用与窗口名称，不读取屏幕文字、不联网、不拦截按键、不处理屏保。关闭此服务可恢复小米 Home 键行为。</string>
+          </resources>
+          SOURCE_strings
           cp launcher/app/src/main/res/mipmap-xhdpi/ic_launcher.jpg compat/res/mipmap-xhdpi/
           cp launcher/app/src/main/res/drawable-nodpi/banner.jpg compat/res/drawable-nodpi/
           SDK=/usr/local/lib/android/sdk
           BT="$SDK/build-tools/34.0.0"
           JAR="$SDK/platforms/android-34/android.jar"
           "$BT/aapt2" compile --dir compat/res -o compat/res.zip
-          "$BT/aapt2" link -I "$JAR" --manifest compat/AndroidManifest.xml --version-code 1 --version-name 1.0 -o compat/unsigned.apk compat/res.zip
+          "$BT/aapt2" link -I "$JAR" --manifest compat/AndroidManifest.xml --version-code 2 --version-name 2.0 -o compat/unsigned.apk compat/res.zip
           javac -encoding UTF-8 -source 8 -target 8 -classpath "$JAR" -d compat/classes compat/src/com/gathin/tvhome/bridge/*.java
           "$BT/d8" --lib "$JAR" --min-api 26 --output compat/dex compat/classes/com/gathin/tvhome/bridge/*.class
           zip -j compat/unsigned.apk compat/dex/classes.dex
