@@ -10,6 +10,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
     defaults:
       run:
         working-directory: launcher
@@ -24,9 +26,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Prepare Android SDK 34
+      - name: Check preinstalled Android SDK 34
         run: |
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          test -d "$ANDROID_HOME/platforms/android-34"
+          test -x "$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
       - name: Build APK and run existing unit tests
         run: bash ./gradlew --no-daemon :app:testDebugUnitTest :app:assembleRelease
       - name: Verify APK and prepare artifact
